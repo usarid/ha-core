@@ -42,6 +42,10 @@ from .const import CONF_LOGIN_DATA, CONF_TOTP_SECRET, CONF_UTILITY, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
+# How far back to reach for cost the utility published late (on top of the 30 days
+# re-read on every update).
+MAX_COST_LAG = timedelta(days=60)
+
 type OpowerConfigEntry = ConfigEntry[OpowerCoordinator]
 
 
@@ -222,19 +226,13 @@ class OpowerCoordinator(DataUpdateCoordinator[dict[str, OpowerData]]):
                 unit_of_measurement=consumption_unit,
             )
 
-            last_stat = await get_instance(self.hass).async_add_executor_job(
-                get_last_statistics, self.hass, 1, consumption_statistic_id, True, set()
+            last_consumption_start = await self._async_get_last_stat_start(
+                consumption_statistic_id
             )
-            if not last_stat:
+            last_cost_start = await self._async_get_last_stat_start(cost_statistic_id)
+            if last_consumption_start is None:
                 _LOGGER.debug("Updating statistic for the first time")
-                cost_reads = await self._async_get_cost_reads(
-                    account, self.api.utility.timezone()
-                )
-                cost_sum = 0.0
-                compensation_sum = 0.0
-                consumption_sum = 0.0
-                return_sum = 0.0
-                last_stats_time = None
+                start_time = None
             else:
                 migrated = await self._async_maybe_migrate_statistics(
                     account.utility_account_id,
@@ -257,135 +255,77 @@ class OpowerCoordinator(DataUpdateCoordinator[dict[str, OpowerData]]):
                         "Statistics migration completed. Skipping update for now"
                     )
                     continue
-                cost_reads = await self._async_get_cost_reads(
-                    account,
-                    self.api.utility.timezone(),
-                    last_stat[consumption_statistic_id][0]["start"],
-                )
-                if not cost_reads:
-                    _LOGGER.debug("No recent usage/cost data. Skipping update")
-                    continue
-                start = min(
-                    cost_reads[0].start_time,
-                    dt_util.utc_from_timestamp(
-                        last_stat[consumption_statistic_id][0]["start"]
-                    ),
-                )
-                _LOGGER.debug("Getting statistics at: %s", start)
-                # In the common case there should be a previous statistic at start time
-                # so we only need to fetch one statistic. If there isn't any, fetch all.
-                stats = await get_instance(self.hass).async_add_executor_job(
-                    self._get_statistics,
-                    start,
-                    {
-                        cost_statistic_id,
-                        compensation_statistic_id,
-                        consumption_statistic_id,
-                        return_statistic_id,
-                    },
-                )
-                # We are in this code path only if get_last_statistics found a stat
-                # so statistics_during_period should also have found at least one.
-                assert stats
+                start_time = last_consumption_start
+                if last_cost_start is not None and last_cost_start < start_time:
+                    # Cost lags usage (the utility hasn't priced the latest reads):
+                    # reach back far enough to fill it in, but bounded so a utility
+                    # that stops publishing cost doesn't cause ever longer fetches.
+                    start_time = max(
+                        last_cost_start,
+                        start_time - MAX_COST_LAG.total_seconds(),
+                    )
+            cost_reads = await self._async_get_cost_reads(
+                account, self.api.utility.timezone(), start_time
+            )
+            if not cost_reads:
+                _LOGGER.debug("No recent usage/cost data. Skipping update")
+                continue
 
-                def _safe_get_sum(records: list[Any]) -> float:
-                    if records and "sum" in records[0]:
-                        return float(records[0]["sum"])
-                    return 0.0
+            last_changed_per_account[account.utility_account_id] = cost_reads[
+                -1
+            ].start_time
 
-                cost_sum = _safe_get_sum(stats.get(cost_statistic_id, []))
-                compensation_sum = _safe_get_sum(
-                    stats.get(compensation_statistic_id, [])
-                )
-                consumption_sum = _safe_get_sum(stats.get(consumption_statistic_id, []))
-                return_sum = _safe_get_sum(stats.get(return_statistic_id, []))
-                last_stats_time = stats[consumption_statistic_id][0]["start"]
-
-            if cost_reads:
-                last_changed_per_account[account.utility_account_id] = cost_reads[
-                    -1
-                ].start_time
-            elif last_stats_time is not None:
-                last_changed_per_account[account.utility_account_id] = (
-                    dt_util.utc_from_timestamp(last_stats_time)
-                )
-
-            cost_statistics = []
-            compensation_statistics = []
-            consumption_statistics = []
-            return_statistics = []
-
+            # Usage for every read; cost only for the reads the utility has priced.
+            # Each pair resumes from its own statistics, so cost fills in once it's
+            # published.
+            consumption_rows = []
             for cost_read in cost_reads:
-                start = cost_read.start_time
-                if last_stats_time is not None and start.timestamp() <= last_stats_time:
-                    continue
-
-                cost_state = max(0, cost_read.provided_cost)
-                compensation_state = max(0, -cost_read.provided_cost)
                 # Prefer the meter's own import and export registers when the
                 # utility publishes them. Splitting the net consumption on its
                 # sign undercounts both directions on a net-metered site,
                 # because an interval that is net-export can still contain real
                 # import (and vice versa).
                 if cost_read.imported is not None and cost_read.exported is not None:
-                    consumption_state = cost_read.imported
-                    return_state = cost_read.exported
+                    consumption_rows.append(
+                        (cost_read.start_time, cost_read.imported, cost_read.exported)
+                    )
                 else:
-                    consumption_state = max(0, cost_read.consumption)
-                    return_state = max(0, -cost_read.consumption)
-
-                cost_sum += cost_state
-                compensation_sum += compensation_state
-                consumption_sum += consumption_state
-                return_sum += return_state
-
-                cost_statistics.append(
-                    StatisticData(start=start, state=cost_state, sum=cost_sum)
-                )
-                compensation_statistics.append(
-                    StatisticData(
-                        start=start, state=compensation_state, sum=compensation_sum
+                    consumption_rows.append(
+                        (
+                            cost_read.start_time,
+                            max(0, cost_read.consumption),
+                            max(0, -cost_read.consumption),
+                        )
                     )
+            cost_rows = [
+                (
+                    cost_read.start_time,
+                    max(0, cost_read.provided_cost),
+                    max(0, -cost_read.provided_cost),
                 )
-                consumption_statistics.append(
-                    StatisticData(
-                        start=start, state=consumption_state, sum=consumption_sum
-                    )
-                )
-                return_statistics.append(
-                    StatisticData(start=start, state=return_state, sum=return_sum)
-                )
-
-            _LOGGER.debug(
-                "Adding %s statistics for %s",
-                len(cost_statistics),
-                cost_statistic_id,
+                for cost_read in cost_reads
+                if cost_read.provided_cost is not None
+            ]
+            await self._async_add_statistics(
+                consumption_rows,
+                last_consumption_start,
+                consumption_metadata,
+                return_metadata,
             )
-            async_add_external_statistics(self.hass, cost_metadata, cost_statistics)
-            _LOGGER.debug(
-                "Adding %s statistics for %s",
-                len(compensation_statistics),
-                compensation_statistic_id,
+            await self._async_add_statistics(
+                cost_rows, last_cost_start, cost_metadata, compensation_metadata
             )
-            async_add_external_statistics(
-                self.hass, compensation_metadata, compensation_statistics
-            )
-            _LOGGER.debug(
-                "Adding %s statistics for %s",
-                len(consumption_statistics),
-                consumption_statistic_id,
-            )
-            async_add_external_statistics(
-                self.hass, consumption_metadata, consumption_statistics
-            )
-            _LOGGER.debug(
-                "Adding %s statistics for %s",
-                len(return_statistics),
-                return_statistic_id,
-            )
-            async_add_external_statistics(self.hass, return_metadata, return_statistics)
 
         return last_changed_per_account
+
+    async def _async_get_last_stat_start(self, statistic_id: str) -> float | None:
+        """Return the start of the last statistic, if there is one."""
+        last_stat = await get_instance(self.hass).async_add_executor_job(
+            get_last_statistics, self.hass, 1, statistic_id, True, set()
+        )
+        if not last_stat:
+            return None
+        return last_stat[statistic_id][0]["start"]
 
     def _get_statistics(
         self, start: datetime, statistic_ids: set[str]
@@ -410,6 +350,64 @@ class OpowerCoordinator(DataUpdateCoordinator[dict[str, OpowerData]]):
                     start,
                 )
         return stats
+
+    async def _async_add_statistics(
+        self,
+        rows: list[tuple[datetime, float, float]],
+        last_stat_start: float | None,
+        metadata: StatisticMetaData,
+        opposite_metadata: StatisticMetaData,
+    ) -> None:
+        """Add a pair of statistics (consumption/return or cost/compensation).
+
+        Rows at or before the statistics they resume from are skipped; the rest
+        replace what's there, so data the utility corrects or prices later is
+        picked up.
+        """
+        statistic_id = metadata["statistic_id"]
+        opposite_statistic_id = opposite_metadata["statistic_id"]
+        total = 0.0
+        opposite_total = 0.0
+        last_stats_time: float | None = None
+        if rows and last_stat_start is not None:
+            start = min(rows[0][0], dt_util.utc_from_timestamp(last_stat_start))
+            _LOGGER.debug("Getting statistics at: %s", start)
+            # In the common case there should be a previous statistic at start time
+            # so we only need to fetch one statistic. If there isn't any, fetch all.
+            stats = await get_instance(self.hass).async_add_executor_job(
+                self._get_statistics, start, {statistic_id, opposite_statistic_id}
+            )
+            if stats.get(statistic_id):
+
+                def _safe_get_sum(records: list[Any]) -> float:
+                    if records and "sum" in records[0]:
+                        return float(records[0]["sum"])
+                    return 0.0
+
+                total = _safe_get_sum(stats[statistic_id])
+                opposite_total = _safe_get_sum(stats.get(opposite_statistic_id, []))
+                last_stats_time = stats[statistic_id][0]["start"]
+
+        statistics = []
+        opposite_statistics = []
+        for start, state, opposite_state in rows:
+            if last_stats_time is not None and start.timestamp() <= last_stats_time:
+                continue
+            total += state
+            opposite_total += opposite_state
+            statistics.append(StatisticData(start=start, state=state, sum=total))
+            opposite_statistics.append(
+                StatisticData(start=start, state=opposite_state, sum=opposite_total)
+            )
+
+        _LOGGER.debug("Adding %s statistics for %s", len(statistics), statistic_id)
+        async_add_external_statistics(self.hass, metadata, statistics)
+        _LOGGER.debug(
+            "Adding %s statistics for %s",
+            len(opposite_statistics),
+            opposite_statistic_id,
+        )
+        async_add_external_statistics(self.hass, opposite_metadata, opposite_statistics)
 
     async def _async_maybe_migrate_statistics(
         self,
@@ -529,9 +527,13 @@ class OpowerCoordinator(DataUpdateCoordinator[dict[str, OpowerData]]):
         return True
 
     def _get_need_migration_source_ids(self, migration_map: dict[str, str]) -> set[str]:
-        """Return the source IDs whose target statistic does not exist yet."""
+        """Return the source IDs that exist and whose target statistic does not yet."""
         need_migration_source_ids = set()
         for source_id, target_id in migration_map.items():
+            # A source with no statistics (e.g. cost, when usage was imported before
+            # the utility priced any of it) has nothing to migrate.
+            if not get_last_statistics(self.hass, 1, source_id, True, set()):
+                continue
             last_target_stat = get_last_statistics(
                 self.hass,
                 1,

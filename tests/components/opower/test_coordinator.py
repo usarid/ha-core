@@ -809,3 +809,162 @@ async def test_coordinator_subsequent_run_time_gaps(
     )
     assert [s["state"] for s in stats[statistic_id]] == [1.5, 2.0, 3.0]
     assert [s["sum"] for s in stats[statistic_id]] == [1.5, 3.5, 6.5]
+
+
+@pytest.mark.usefixtures("recorder_mock")
+async def test_coordinator_unpriced_reads_get_their_cost_later(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_opower_api: AsyncMock,
+) -> None:
+    """Test usage is recorded before it's priced and the cost is filled in once it is."""
+    account = mock_opower_api.async_get_accounts.return_value[0]
+    mock_opower_api.async_get_accounts.return_value = [account]
+
+    def read(hour: int, consumption: float, cost: float | None) -> CostRead:
+        return CostRead(
+            start_time=dt_util.as_utc(datetime(2023, 1, 1, hour)),
+            end_time=dt_util.as_utc(datetime(2023, 1, 1, hour + 1)),
+            consumption=consumption,
+            provided_cost=cost,
+        )
+
+    mock_opower_api.async_get_cost_reads.return_value = [
+        read(8, 1.0, 0.5),
+        read(9, 2.0, None),
+        read(10, 3.0, None),
+    ]
+    coordinator = OpowerCoordinator(hass, mock_config_entry)
+    await coordinator._async_update_data()
+    await async_wait_recording_done(hass)
+
+    consumption_id = "opower:pge_elec_111111_energy_consumption"
+    cost_id = "opower:pge_elec_111111_energy_cost"
+    stats = await hass.async_add_executor_job(
+        statistics_during_period,
+        hass,
+        dt_util.utc_from_timestamp(0),
+        None,
+        {consumption_id, cost_id},
+        "hour",
+        None,
+        {"state", "sum"},
+    )
+    assert [s["sum"] for s in stats[consumption_id]] == [1.0, 3.0, 6.0]
+    # No $0 for the hours the utility hasn't priced yet
+    assert [s["sum"] for s in stats[cost_id]] == [0.5]
+
+    mock_opower_api.async_get_cost_reads.return_value = [
+        read(8, 1.0, 0.5),
+        read(9, 2.0, 0.6),
+        read(10, 3.0, 0.7),
+        read(11, 4.0, None),
+    ]
+    await coordinator._async_update_data()
+    await async_wait_recording_done(hass)
+
+    stats = await hass.async_add_executor_job(
+        statistics_during_period,
+        hass,
+        dt_util.utc_from_timestamp(0),
+        None,
+        {consumption_id, cost_id},
+        "hour",
+        None,
+        {"state", "sum"},
+    )
+    assert [s["sum"] for s in stats[consumption_id]] == [1.0, 3.0, 6.0, 10.0]
+    assert [s["state"] for s in stats[cost_id]] == [0.5, 0.6, 0.7]
+    assert [s["sum"] for s in stats[cost_id]] == pytest.approx([0.5, 1.1, 1.8])
+
+
+@pytest.mark.usefixtures("recorder_mock")
+@pytest.mark.parametrize(
+    ("first_run_reads", "expected_days_back"),
+    [
+        pytest.param([(40, 1.0), (0, None)], 40 + 30, id="cost_lags_40_days"),
+        pytest.param([(100, 1.0), (0, None)], 60 + 30, id="cost_lag_bounded"),
+        pytest.param([(1, 1.0), (0, 1.0)], 30, id="cost_up_to_date"),
+        pytest.param([(0, None)], 30, id="no_cost_at_all"),
+    ],
+)
+async def test_coordinator_reaches_back_for_lagging_cost(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_opower_api: AsyncMock,
+    first_run_reads: list[tuple[int, float | None]],
+    expected_days_back: int,
+) -> None:
+    """Test updates re-read far enough back for cost the utility publishes late, within a bound."""
+    account = dataclasses.replace(
+        mock_opower_api.async_get_accounts.return_value[0],
+        read_resolution=ReadResolution.DAY,
+    )
+    mock_opower_api.async_get_accounts.return_value = [account]
+    last_day = dt_util.start_of_local_day() - timedelta(days=2)
+
+    mock_opower_api.async_get_cost_reads.return_value = [
+        CostRead(
+            start_time=last_day - timedelta(days=days_back),
+            end_time=last_day - timedelta(days=days_back - 1),
+            consumption=1.0,
+            provided_cost=cost,
+        )
+        for days_back, cost in first_run_reads
+    ]
+    coordinator = OpowerCoordinator(hass, mock_config_entry)
+    await coordinator._async_update_data()
+    await async_wait_recording_done(hass)
+
+    mock_opower_api.async_get_cost_reads.reset_mock()
+    await coordinator._async_update_data()
+    await async_wait_recording_done(hass)
+
+    mock_opower_api.async_get_cost_reads.assert_awaited_once()
+    # Within an hour: the bound is counted in hours, so a DST change can shift it
+    start = mock_opower_api.async_get_cost_reads.await_args.args[2]
+    expected = last_day - timedelta(days=expected_days_back)
+    assert start.timestamp() == pytest.approx(expected.timestamp(), abs=3600)
+
+
+@pytest.mark.usefixtures("recorder_mock")
+async def test_coordinator_usage_without_cost_is_not_migrated(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_opower_api: AsyncMock,
+    issue_registry: ir.IssueRegistry,
+) -> None:
+    """Test an initial import with usage but no cost doesn't stall later updates in migration."""
+    account = mock_opower_api.async_get_accounts.return_value[0]
+    mock_opower_api.async_get_accounts.return_value = [account]
+
+    def read(hour: int) -> CostRead:
+        return CostRead(
+            start_time=dt_util.as_utc(datetime(2023, 1, 1, hour)),
+            end_time=dt_util.as_utc(datetime(2023, 1, 1, hour + 1)),
+            consumption=1.0,
+            provided_cost=None,
+        )
+
+    mock_opower_api.async_get_cost_reads.return_value = [read(8)]
+    coordinator = OpowerCoordinator(hass, mock_config_entry)
+    await coordinator._async_update_data()
+    await async_wait_recording_done(hass)
+
+    mock_opower_api.async_get_cost_reads.return_value = [read(8), read(9)]
+    await coordinator._async_update_data()
+    await async_wait_recording_done(hass)
+
+    consumption_id = "opower:pge_elec_111111_energy_consumption"
+    stats = await hass.async_add_executor_job(
+        statistics_during_period,
+        hass,
+        dt_util.utc_from_timestamp(0),
+        None,
+        {consumption_id},
+        "hour",
+        None,
+        {"sum"},
+    )
+    assert [s["sum"] for s in stats[consumption_id]] == [1.0, 2.0]
+    assert not issue_registry.issues
