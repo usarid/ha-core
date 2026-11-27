@@ -42,13 +42,9 @@ from .const import CONF_LOGIN_DATA, CONF_TOTP_SECRET, CONF_UTILITY, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-# How far back from the last consumption statistic to reach for cost the utility
-# published late. The library also starts hourly reads no earlier than 60 days
-# before the end of the window, so in practice this gives up to 60 days of
-# lookback for hourly accounts and up to 90 days for daily ones (the 30 days
-# _async_get_cost_reads re-reads on every update, plus this). Cost lagging by
-# more than this is not reached for: the utility doesn't publish it at this
-# resolution (e.g. it prices only whole bills), so re-reading would never find it.
+# Lookback for late-priced cost, on top of the 30 days re-read every update (the
+# library caps hourly reads at 60 days: up to 60 days for HOUR, 90 for DAY).
+# Longer lags are not reached for: such cost is only published per bill.
 MAX_COST_LAG = timedelta(days=60)
 
 type OpowerConfigEntry = ConfigEntry[OpowerCoordinator]
@@ -56,15 +52,27 @@ type OpowerConfigEntry = ConfigEntry[OpowerCoordinator]
 
 @dataclass
 class _StatisticPair:
-    """Rows for a pair of statistics and what is already stored for them."""
+    """Rows for a pair of statistics and the last start of each, if stored."""
 
     rows: list[tuple[datetime, float, float]]
-    # Start of the last statistic of the pair (either of the two), if any
-    last_stat_start: float | None
+    last_start: float | None
+    opposite_last_start: float | None
     metadata: StatisticMetaData
     opposite_metadata: StatisticMetaData
-    # Starts of reads in the window that have no row in this pair (unpriced reads)
+    # Starts of reads in the window without a row here (unpriced reads)
     gaps: list[datetime] = field(default_factory=list)
+
+    @property
+    def last_stat_start(self) -> float | None:
+        """Return the start of the last statistic of the pair, if any."""
+        return max(
+            (
+                start
+                for start in (self.last_start, self.opposite_last_start)
+                if start is not None
+            ),
+            default=None,
+        )
 
 
 @dataclass
@@ -72,18 +80,15 @@ class _Baseline:
     """Where a pair of statistics resumes from.
 
     Rows at or before `after` (`opposite_after`) are already stored for the
-    statistic (its opposite); None means every row is written.
+    statistic (its opposite); None means every row is written. `kept` holds
+    stored rows to write back for reads that came without a value.
     """
 
     total: float
     opposite_total: float
     after: float | None
     opposite_after: float | None
-
-
-def _latest(*starts: float | None) -> float | None:
-    """Return the latest of the given statistic starts, or None if there are none."""
-    return max((start for start in starts if start is not None), default=None)
+    kept: list[tuple[datetime, float, float]] = field(default_factory=list)
 
 
 def _should_update(pair: _StatisticPair) -> bool:
@@ -94,25 +99,9 @@ def _should_update(pair: _StatisticPair) -> bool:
         pair.last_stat_start is not None
         and pair.rows[-1][0].timestamp() < pair.last_stat_start
     ):
-        # The utility returned less than is stored (e.g. priced reads that end
-        # before the last cost statistic). Rewriting up to the end of the rows
-        # while leaving the newer statistics as they are would break the
-        # running sum at the boundary, so leave the pair for the next update.
+        # Rewriting up to rows[-1] would break the sums of the newer statistics
         _LOGGER.debug(
             "Reads for %s end before its last statistic; skipping",
-            pair.metadata["statistic_id"],
-        )
-        return False
-    if pair.last_stat_start is not None and any(
-        pair.rows[0][0] < gap and gap.timestamp() <= pair.last_stat_start
-        for gap in pair.gaps
-    ):
-        # A read that is stored with a value came back without one (e.g. the
-        # utility withdrew its price). The rows after it would be rewritten but
-        # its own stored row would not, leaving the sums of the following hours
-        # wrong, so leave the pair for the next update.
-        _LOGGER.debug(
-            "Reads for %s have a gap where a statistic is stored; skipping",
             pair.metadata["statistic_id"],
         )
         return False
@@ -407,13 +396,15 @@ class OpowerCoordinator(DataUpdateCoordinator[dict[str, OpowerData]]):
             pairs = [
                 _StatisticPair(
                     consumption_rows,
-                    _latest(last_consumption_start, last_starts[return_statistic_id]),
+                    last_consumption_start,
+                    last_starts[return_statistic_id],
                     consumption_metadata,
                     return_metadata,
                 ),
                 _StatisticPair(
                     cost_rows,
-                    _latest(last_cost_start, last_starts[compensation_statistic_id]),
+                    last_cost_start,
+                    last_starts[compensation_statistic_id],
                     cost_metadata,
                     compensation_metadata,
                     [
@@ -445,84 +436,145 @@ class OpowerCoordinator(DataUpdateCoordinator[dict[str, OpowerData]]):
         return starts
 
     def _get_statistics(
-        self, start: datetime, id_pairs: list[tuple[str, str]]
-    ) -> dict[str, _Baseline | None]:
-        """Return where each pair resumes from, keyed by the pair's statistic.
+        self, start: datetime, statistic_ids: set[str], required_ids: set[str]
+    ) -> dict[str, list[Any]]:
+        """Get the statistics at start, or else all of them from start on.
 
-        Uses the statistic at start, or else the oldest one after start. The
-        opposite sum is taken at the same time, from its latest statistic at or
-        before it (0 if there is none), so the pair stays aligned. If only the
-        opposite statistic has rows (the other was cleared), the opposite resumes
-        from its own row and the cleared one is rewritten from 0. None if neither
-        has a row at or after start (both were deleted since their last start
-        was read). One query covers every pair.
+        Falls back to the open-ended query only if one of required_ids has no
+        statistic at start.
         """
-        statistic_ids = {statistic_id for pair in id_pairs for statistic_id in pair}
         stats: dict[str, list[Any]] = {}
         for end in (start + timedelta(seconds=1), None):
             stats = statistics_during_period(
                 self.hass, start, end, statistic_ids, "hour", None, {"sum"}
             )
-            if all(stats.get(statistic_id) for statistic_id, _ in id_pairs):
+            if all(stats.get(statistic_id) for statistic_id in required_ids):
                 break
             if end:
                 _LOGGER.debug(
                     "Not found. Trying to find the oldest statistic after %s",
                     start,
                 )
-        result: dict[str, _Baseline | None] = {}
-        for statistic_id, opposite_statistic_id in id_pairs:
-            primary = stats.get(statistic_id) or []
-            opposite = stats.get(opposite_statistic_id) or []
-            anchor = (primary or opposite or [None])[0]
-            if anchor is None:
-                result[statistic_id] = None
-                continue
-            anchor_start: float = anchor["start"]
-            totals = []
-            for records in (primary, opposite):
-                total = 0.0
-                for record in records:
-                    if record["start"] > anchor_start:
-                        break
-                    total = float(record.get("sum") or 0.0)
-                totals.append(total)
-            result[statistic_id] = _Baseline(
-                totals[0],
-                totals[1],
-                anchor_start if primary else None,
-                anchor_start,
+        return stats
+
+    def _get_baseline(
+        self, pair: _StatisticPair, stats: dict[str, list[Any]]
+    ) -> _Baseline | None:
+        """Return where a pair resumes from, given its statistics from its start.
+
+        A statistic that had no rows when the update started is written from 0.
+        None if one that had rows lost them since (cleared during the update):
+        writing it from 0 for this window alone would leave its older history
+        missing for good, so the pair waits for the next update.
+        """
+        statistic_id = pair.metadata["statistic_id"]
+        opposite_statistic_id = pair.opposite_metadata["statistic_id"]
+        primary = stats.get(statistic_id) or []
+        opposite = stats.get(opposite_statistic_id) or []
+        if (pair.last_start is not None and not primary) or (
+            pair.last_start is None
+            and pair.opposite_last_start is not None
+            and not opposite
+        ):
+            return None
+        anchor: float = (primary or opposite)[0]["start"]
+        totals = []
+        for records in (primary, opposite):
+            total = 0.0
+            for record in records:
+                if record["start"] > anchor:
+                    break
+                total = float(record.get("sum") or 0.0)
+            totals.append(total)
+        return _Baseline(
+            totals[0],
+            totals[1],
+            anchor if pair.last_start is not None else None,
+            anchor if pair.opposite_last_start is not None else None,
+        )
+
+    def _get_kept_rows(
+        self, pair: _StatisticPair, after: float
+    ) -> list[tuple[datetime, float, float]]:
+        """Return stored rows for reads in the window that came without a value.
+
+        Without them the rows after such a read would be rewritten around a
+        stored row that isn't, breaking the sums that follow.
+        """
+        gaps = [gap for gap in pair.gaps if gap.timestamp() > after]
+        if not gaps or pair.last_stat_start is None:
+            return []
+        gaps = [gap for gap in gaps if gap.timestamp() <= pair.last_stat_start]
+        if not gaps:
+            return []
+        statistic_id = pair.metadata["statistic_id"]
+        opposite_statistic_id = pair.opposite_metadata["statistic_id"]
+        stats = statistics_during_period(
+            self.hass,
+            gaps[0],
+            gaps[-1] + timedelta(seconds=1),
+            {statistic_id, opposite_statistic_id},
+            "hour",
+            None,
+            {"state"},
+        )
+        opposite_states = {
+            record["start"]: float(record.get("state") or 0.0)
+            for record in stats.get(opposite_statistic_id, [])
+        }
+        gap_starts = {gap.timestamp(): gap for gap in gaps}
+        return [
+            (
+                gap_starts[record["start"]],
+                float(record.get("state") or 0.0),
+                opposite_states.get(record["start"], 0.0),
             )
-        return result
+            for record in stats.get(statistic_id, [])
+            if record["start"] in gap_starts
+        ]
 
     def _get_baselines(self, pairs: list[_StatisticPair]) -> list[_Baseline | None]:
-        """Return (sum, opposite sum, start) to resume each pair from.
+        """Return where each pair resumes from.
 
         Runs in the recorder executor, so all pairs share one job, and pairs that
         resume from the same time share one query.
         """
-        by_start: dict[datetime, list[tuple[str, str]]] = {}
+        # start -> (statistics to query, statistics the pairs resume from)
+        by_start: dict[datetime, tuple[set[str], set[str]]] = {}
+        starts: list[datetime | None] = []
         for pair in pairs:
-            if pair.last_stat_start is not None:
-                start = min(
-                    pair.rows[0][0], dt_util.utc_from_timestamp(pair.last_stat_start)
-                )
-                by_start.setdefault(start, []).append(
-                    (
-                        pair.metadata["statistic_id"],
-                        pair.opposite_metadata["statistic_id"],
-                    )
-                )
-        found: dict[str, _Baseline | None] = {}
-        for start, id_pairs in by_start.items():
+            last_stat_start = pair.last_stat_start
+            if last_stat_start is None:
+                starts.append(None)
+                continue
+            start = min(pair.rows[0][0], dt_util.utc_from_timestamp(last_stat_start))
+            starts.append(start)
+            statistic_ids, required_ids = by_start.setdefault(start, (set(), set()))
+            statistic_ids.update(
+                (pair.metadata["statistic_id"], pair.opposite_metadata["statistic_id"])
+            )
+            # The pair resumes from the primary statistic unless it was cleared
+            required_ids.add(
+                pair.metadata["statistic_id"]
+                if pair.last_start is not None
+                else pair.opposite_metadata["statistic_id"]
+            )
+        stats_by_start: dict[datetime, dict[str, list[Any]]] = {}
+        for start, (statistic_ids, required_ids) in by_start.items():
             _LOGGER.debug("Getting statistics at: %s", start)
-            found.update(self._get_statistics(start, id_pairs))
-        return [
-            found[pair.metadata["statistic_id"]]
-            if pair.last_stat_start is not None
-            else _Baseline(0.0, 0.0, None, None)
-            for pair in pairs
-        ]
+            stats_by_start[start] = self._get_statistics(
+                start, statistic_ids, required_ids
+            )
+        baselines: list[_Baseline | None] = []
+        for pair, pair_start in zip(pairs, starts, strict=True):
+            if pair_start is None:
+                baselines.append(_Baseline(0.0, 0.0, None, None))
+                continue
+            baseline = self._get_baseline(pair, stats_by_start[pair_start])
+            if baseline is not None and baseline.after is not None:
+                baseline.kept = self._get_kept_rows(pair, baseline.after)
+            baselines.append(baseline)
+        return baselines
 
     async def _async_add_statistics(self, pairs: list[_StatisticPair]) -> None:
         """Add pairs of statistics (consumption/return, cost/compensation).
@@ -547,7 +599,7 @@ class OpowerCoordinator(DataUpdateCoordinator[dict[str, OpowerData]]):
             opposite_total = baseline.opposite_total
             statistics = []
             opposite_statistics = []
-            for start, state, opposite_state in pair.rows:
+            for start, state, opposite_state in sorted(pair.rows + baseline.kept):
                 timestamp = start.timestamp()
                 if baseline.after is None or timestamp > baseline.after:
                     total += state
