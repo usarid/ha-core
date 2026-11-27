@@ -13,7 +13,7 @@ from syrupy.assertion import SnapshotAssertion
 
 from homeassistant.components.opower.const import DOMAIN
 from homeassistant.components.opower.coordinator import OpowerCoordinator
-from homeassistant.components.recorder import Recorder
+from homeassistant.components.recorder import Recorder, get_instance
 from homeassistant.components.recorder.models import (
     StatisticData,
     StatisticMeanType,
@@ -22,6 +22,7 @@ from homeassistant.components.recorder.models import (
 from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
     get_last_statistics,
+    get_metadata,
     statistics_during_period,
 )
 from homeassistant.const import UnitOfEnergy
@@ -968,3 +969,215 @@ async def test_coordinator_usage_without_cost_is_not_migrated(
     )
     assert [s["sum"] for s in stats[consumption_id]] == [1.0, 2.0]
     assert not issue_registry.issues
+
+
+def _hour_read(hour: int, consumption: float, cost: float | None) -> CostRead:
+    return CostRead(
+        start_time=dt_util.as_utc(datetime(2023, 1, 1, hour)),
+        end_time=dt_util.as_utc(datetime(2023, 1, 1, hour + 1)),
+        consumption=consumption,
+        provided_cost=cost,
+    )
+
+
+async def _get_stats(hass: HomeAssistant, statistic_ids: set[str]) -> dict[str, list]:
+    await async_wait_recording_done(hass)
+    return await hass.async_add_executor_job(
+        statistics_during_period,
+        hass,
+        dt_util.utc_from_timestamp(0),
+        None,
+        statistic_ids,
+        "hour",
+        None,
+        {"state", "sum"},
+    )
+
+
+@pytest.mark.usefixtures("recorder_mock")
+async def test_coordinator_priced_reads_ending_early_leave_cost_alone(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_opower_api: AsyncMock,
+) -> None:
+    """Test a response whose priced reads end before the last cost statistic leaves cost and last_changed as they are."""
+    account = mock_opower_api.async_get_accounts.return_value[0]
+    mock_opower_api.async_get_accounts.return_value = [account]
+    consumption_id = "opower:pge_elec_111111_energy_consumption"
+    cost_id = "opower:pge_elec_111111_energy_cost"
+
+    mock_opower_api.async_get_cost_reads.return_value = [
+        _hour_read(8, 1.0, 0.5),
+        _hour_read(9, 2.0, 0.6),
+        _hour_read(10, 3.0, 0.7),
+    ]
+    coordinator = OpowerCoordinator(hass, mock_config_entry)
+    await coordinator._async_update_data()
+    await async_wait_recording_done(hass)
+
+    # Transiently, the utility prices only the first hour, with a changed amount,
+    # and returns usage up to hour 9 only.
+    mock_opower_api.async_get_cost_reads.return_value = [
+        _hour_read(8, 1.0, 0.9),
+        _hour_read(9, 2.0, None),
+    ]
+    data = await coordinator._async_update_data()
+
+    stats = await _get_stats(hass, {consumption_id, cost_id})
+    assert [s["sum"] for s in stats[cost_id]] == pytest.approx([0.5, 1.1, 1.8])
+    assert [s["sum"] for s in stats[consumption_id]] == [1.0, 3.0, 6.0]
+    assert data[account.utility_account_id].last_changed == dt_util.as_utc(
+        datetime(2023, 1, 1, 10)
+    )
+
+
+@pytest.mark.usefixtures("recorder_mock")
+async def test_coordinator_resumes_when_only_the_opposite_statistic_has_a_row_at_start(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_opower_api: AsyncMock,
+) -> None:
+    """Test a compensation row at the start time doesn't make cost resume from zero."""
+    account = mock_opower_api.async_get_accounts.return_value[0]
+    mock_opower_api.async_get_accounts.return_value = [account]
+    cost_id = "opower:pge_elec_111111_energy_cost"
+    compensation_id = "opower:pge_elec_111111_energy_compensation"
+
+    def metadata(statistic_id: str, name: str) -> StatisticMetaData:
+        return StatisticMetaData(
+            mean_type=StatisticMeanType.NONE,
+            has_sum=True,
+            name=name,
+            source=DOMAIN,
+            statistic_id=statistic_id,
+            unit_class=None,
+            unit_of_measurement=None,
+        )
+
+    def stat(hour: int, state: float, total: float) -> StatisticData:
+        return StatisticData(
+            start=dt_util.as_utc(datetime(2023, 1, 1, hour)), state=state, sum=total
+        )
+
+    # Compensation has a row at hour 8; cost starts at hour 9.
+    async_add_external_statistics(
+        hass,
+        metadata(compensation_id, "Opower pge elec 111111 compensation"),
+        [stat(8, 0.25, 0.25), stat(9, 0.0, 0.25)],
+    )
+    async_add_external_statistics(
+        hass, metadata(cost_id, "Opower pge elec 111111 cost"), [stat(9, 1.0, 5.0)]
+    )
+    await async_wait_recording_done(hass)
+
+    coordinator = OpowerCoordinator(hass, mock_config_entry)
+    stats = await hass.async_add_executor_job(
+        coordinator._get_statistics,
+        dt_util.as_utc(datetime(2023, 1, 1, 8)),
+        [(cost_id, compensation_id)],
+    )
+    # Resumes from cost at hour 9, with compensation at the same hour
+    assert stats[cost_id] == (
+        5.0,
+        0.25,
+        dt_util.as_utc(datetime(2023, 1, 1, 9)).timestamp(),
+    )
+
+
+@pytest.mark.usefixtures("recorder_mock")
+async def test_coordinator_consumption_backfill_leaves_cost_alone(
+    hass: HomeAssistant,
+    recorder_mock: Recorder,
+    mock_config_entry: MockConfigEntry,
+    mock_opower_api: AsyncMock,
+) -> None:
+    """Test re-importing consumption after it was cleared doesn't rewrite existing cost."""
+    account = mock_opower_api.async_get_accounts.return_value[0]
+    mock_opower_api.async_get_accounts.return_value = [account]
+    consumption_id = "opower:pge_elec_111111_energy_consumption"
+    cost_id = "opower:pge_elec_111111_energy_cost"
+
+    mock_opower_api.async_get_cost_reads.return_value = [
+        _hour_read(8, 1.0, 0.5),
+        _hour_read(9, 2.0, 0.6),
+        _hour_read(10, 3.0, 0.7),
+    ]
+    coordinator = OpowerCoordinator(hass, mock_config_entry)
+    await coordinator._async_update_data()
+    await async_wait_recording_done(hass)
+
+    recorder_mock.async_clear_statistics([consumption_id])
+    await async_wait_recording_done(hass)
+    # The full-history fetch comes back coarser (two reads for the three hours),
+    # with costs that don't match the hourly ones
+    mock_opower_api.async_get_cost_reads.return_value = [
+        _hour_read(8, 3.0, 1.1),
+        _hour_read(10, 3.0, 9.9),
+    ]
+    await coordinator._async_update_data()
+
+    stats = await _get_stats(hass, {consumption_id, cost_id})
+    assert [s["sum"] for s in stats[consumption_id]] == [3.0, 6.0]
+    assert [s["sum"] for s in stats[cost_id]] == pytest.approx([0.5, 1.1, 1.8])
+
+
+@pytest.mark.usefixtures("recorder_mock")
+async def test_coordinator_usage_only_account_creates_no_cost_statistics(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_opower_api: AsyncMock,
+) -> None:
+    """Test an account without priced reads doesn't register empty cost statistics."""
+    account = mock_opower_api.async_get_accounts.return_value[0]
+    mock_opower_api.async_get_accounts.return_value = [account]
+    mock_opower_api.async_get_cost_reads.return_value = [
+        _hour_read(8, 1.0, None),
+        _hour_read(9, 2.0, None),
+    ]
+    coordinator = OpowerCoordinator(hass, mock_config_entry)
+    await coordinator._async_update_data()
+    await async_wait_recording_done(hass)
+
+    metadata = await hass.async_add_executor_job(get_metadata, hass)
+    assert "opower:pge_elec_111111_energy_consumption" in metadata
+    assert "opower:pge_elec_111111_energy_cost" not in metadata
+    assert "opower:pge_elec_111111_energy_compensation" not in metadata
+
+
+@pytest.mark.usefixtures("recorder_mock")
+async def test_coordinator_uses_two_recorder_jobs_per_account(
+    hass: HomeAssistant,
+    mock_config_entry: MockConfigEntry,
+    mock_opower_api: AsyncMock,
+) -> None:
+    """Test an incremental update reads the recorder in two executor jobs, as before cost was split out."""
+    account = mock_opower_api.async_get_accounts.return_value[0]
+    mock_opower_api.async_get_accounts.return_value = [account]
+    mock_opower_api.async_get_cost_reads.return_value = [
+        _hour_read(8, 1.0, 0.5),
+        _hour_read(9, 2.0, None),
+    ]
+    coordinator = OpowerCoordinator(hass, mock_config_entry)
+    await coordinator._async_update_data()
+    await async_wait_recording_done(hass)
+
+    mock_opower_api.async_get_cost_reads.return_value = [
+        _hour_read(8, 1.0, 0.5),
+        _hour_read(9, 2.0, 0.6),
+        _hour_read(10, 3.0, None),
+    ]
+    instance = get_instance(hass)
+    real_add_executor_job = instance.async_add_executor_job
+    targets: list[str] = []
+
+    def counting_add_executor_job(target, *args):
+        targets.append(getattr(target, "__name__", repr(target)))
+        return real_add_executor_job(target, *args)
+
+    with patch.object(instance, "async_add_executor_job", counting_add_executor_job):
+        await coordinator._async_update_data()
+    # Excluding the one-time migration check
+    assert [t for t in targets if t != "_get_need_migration_source_ids"] == [
+        "_get_last_stat_starts",
+        "_get_baselines",
+    ]

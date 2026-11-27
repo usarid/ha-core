@@ -42,11 +42,44 @@ from .const import CONF_LOGIN_DATA, CONF_TOTP_SECRET, CONF_UTILITY, DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-# How far back to reach for cost the utility published late (on top of the 30 days
-# re-read on every update).
+# How far back from the last consumption statistic to reach for cost the utility
+# published late. The library also starts hourly reads no earlier than 60 days
+# before the end of the window, so in practice this gives up to 60 days of
+# lookback for hourly accounts and up to 90 days for daily ones (the 30 days
+# _async_get_cost_reads re-reads on every update, plus this).
 MAX_COST_LAG = timedelta(days=60)
 
 type OpowerConfigEntry = ConfigEntry[OpowerCoordinator]
+
+
+@dataclass
+class _StatisticPair:
+    """Rows for a pair of statistics and what is already stored for them."""
+
+    rows: list[tuple[datetime, float, float]]
+    last_stat_start: float | None
+    metadata: StatisticMetaData
+    opposite_metadata: StatisticMetaData
+
+
+def _should_update(pair: _StatisticPair) -> bool:
+    """Whether a pair has rows that can be written without a discontinuity."""
+    if not pair.rows:
+        return False
+    if (
+        pair.last_stat_start is not None
+        and pair.rows[-1][0].timestamp() < pair.last_stat_start
+    ):
+        # The utility returned less than is stored (e.g. priced reads that end
+        # before the last cost statistic). Rewriting up to the end of the rows
+        # while leaving the newer statistics as they are would break the
+        # running sum at the boundary, so leave the pair for the next update.
+        _LOGGER.debug(
+            "Reads for %s end before its last statistic; skipping",
+            pair.metadata["statistic_id"],
+        )
+        return False
+    return True
 
 
 @dataclass
@@ -226,10 +259,13 @@ class OpowerCoordinator(DataUpdateCoordinator[dict[str, OpowerData]]):
                 unit_of_measurement=consumption_unit,
             )
 
-            last_consumption_start = await self._async_get_last_stat_start(
-                consumption_statistic_id
+            last_consumption_start, last_cost_start = await get_instance(
+                self.hass
+            ).async_add_executor_job(
+                self._get_last_stat_starts,
+                consumption_statistic_id,
+                cost_statistic_id,
             )
-            last_cost_start = await self._async_get_last_stat_start(cost_statistic_id)
             if last_consumption_start is None:
                 _LOGGER.debug("Updating statistic for the first time")
                 start_time = None
@@ -271,9 +307,13 @@ class OpowerCoordinator(DataUpdateCoordinator[dict[str, OpowerData]]):
                 _LOGGER.debug("No recent usage/cost data. Skipping update")
                 continue
 
-            last_changed_per_account[account.utility_account_id] = cost_reads[
-                -1
-            ].start_time
+            last_changed = cost_reads[-1].start_time
+            if last_consumption_start is not None:
+                # A truncated response must not move last_changed backward.
+                last_changed = max(
+                    last_changed, dt_util.utc_from_timestamp(last_consumption_start)
+                )
+            last_changed_per_account[account.utility_account_id] = last_changed
 
             # Usage for every read; cost only for the reads the utility has priced.
             # Each pair resumes from its own statistics, so cost fills in once it's
@@ -306,108 +346,156 @@ class OpowerCoordinator(DataUpdateCoordinator[dict[str, OpowerData]]):
                 for cost_read in cost_reads
                 if cost_read.provided_cost is not None
             ]
+            if last_consumption_start is None and last_cost_start is not None:
+                # A consumption-only backfill fetches the full history at coarse
+                # resolution (bill, then day, then hour). Writing that as cost would
+                # overwrite finer cost statistics already stored, so leave cost to
+                # the next incremental update, which reads it at native resolution.
+                _LOGGER.debug(
+                    "Backfilling consumption only; leaving %s as is", cost_statistic_id
+                )
+                cost_rows = []
+            pairs = [
+                _StatisticPair(
+                    consumption_rows,
+                    last_consumption_start,
+                    consumption_metadata,
+                    return_metadata,
+                ),
+                _StatisticPair(
+                    cost_rows, last_cost_start, cost_metadata, compensation_metadata
+                ),
+            ]
             await self._async_add_statistics(
-                consumption_rows,
-                last_consumption_start,
-                consumption_metadata,
-                return_metadata,
-            )
-            await self._async_add_statistics(
-                cost_rows, last_cost_start, cost_metadata, compensation_metadata
+                [pair for pair in pairs if _should_update(pair)]
             )
 
         return last_changed_per_account
 
-    async def _async_get_last_stat_start(self, statistic_id: str) -> float | None:
-        """Return the start of the last statistic, if there is one."""
-        last_stat = await get_instance(self.hass).async_add_executor_job(
-            get_last_statistics, self.hass, 1, statistic_id, True, set()
-        )
-        if not last_stat:
-            return None
-        return last_stat[statistic_id][0]["start"]
+    def _get_last_stat_starts(
+        self, consumption_statistic_id: str, cost_statistic_id: str
+    ) -> tuple[float | None, float | None]:
+        """Return the start of the last consumption and cost statistics.
+
+        Runs in the recorder executor; both lookups share one job.
+        """
+
+        def last_start(statistic_id: str) -> float | None:
+            last_stat = get_last_statistics(self.hass, 1, statistic_id, True, set())
+            if not last_stat:
+                return None
+            return last_stat[statistic_id][0]["start"]
+
+        return last_start(consumption_statistic_id), last_start(cost_statistic_id)
 
     def _get_statistics(
-        self, start: datetime, statistic_ids: set[str]
-    ) -> dict[str, list[Any]]:
-        """Get the statistics at start, or the oldest statistics after start."""
+        self, start: datetime, id_pairs: list[tuple[str, str]]
+    ) -> dict[str, tuple[float, float, float]]:
+        """Return the sums of each pair at start, and the start they were taken at.
+
+        Keyed by the pair's statistic. Uses the statistic at start, or else the
+        oldest one after start. The opposite sum is taken at the same time, from
+        its latest statistic at or before it (0 if there is none), so the pair
+        stays aligned. One query covers every pair.
+        """
+        statistic_ids = {statistic_id for pair in id_pairs for statistic_id in pair}
         stats: dict[str, list[Any]] = {}
         for end in (start + timedelta(seconds=1), None):
             stats = statistics_during_period(
-                self.hass,
-                start,
-                end,
-                statistic_ids,
-                "hour",
-                None,
-                {"sum"},
+                self.hass, start, end, statistic_ids, "hour", None, {"sum"}
             )
-            if stats:
+            if all(stats.get(statistic_id) for statistic_id, _ in id_pairs):
                 break
             if end:
                 _LOGGER.debug(
                     "Not found. Trying to find the oldest statistic after %s",
                     start,
                 )
-        return stats
+        result: dict[str, tuple[float, float, float]] = {}
+        for statistic_id, opposite_statistic_id in id_pairs:
+            # Callers pass a start at or before the last statistic, so there is one.
+            assert stats.get(statistic_id)
+            record = stats[statistic_id][0]
+            last_stats_time: float = record["start"]
+            opposite_total = 0.0
+            for opposite in stats.get(opposite_statistic_id, []):
+                if opposite["start"] > last_stats_time:
+                    break
+                opposite_total = float(opposite.get("sum") or 0.0)
+            result[statistic_id] = (
+                float(record.get("sum") or 0.0),
+                opposite_total,
+                last_stats_time,
+            )
+        return result
 
-    async def _async_add_statistics(
-        self,
-        rows: list[tuple[datetime, float, float]],
-        last_stat_start: float | None,
-        metadata: StatisticMetaData,
-        opposite_metadata: StatisticMetaData,
-    ) -> None:
-        """Add a pair of statistics (consumption/return or cost/compensation).
+    def _get_baselines(
+        self, pairs: list[_StatisticPair]
+    ) -> list[tuple[float, float, float | None]]:
+        """Return (sum, opposite sum, start) to resume each pair from.
+
+        Runs in the recorder executor, so all pairs share one job, and pairs that
+        resume from the same time share one query.
+        """
+        by_start: dict[datetime, list[tuple[str, str]]] = {}
+        for pair in pairs:
+            if pair.last_stat_start is not None:
+                start = min(
+                    pair.rows[0][0], dt_util.utc_from_timestamp(pair.last_stat_start)
+                )
+                by_start.setdefault(start, []).append(
+                    (
+                        pair.metadata["statistic_id"],
+                        pair.opposite_metadata["statistic_id"],
+                    )
+                )
+        found: dict[str, tuple[float, float, float]] = {}
+        for start, id_pairs in by_start.items():
+            _LOGGER.debug("Getting statistics at: %s", start)
+            found.update(self._get_statistics(start, id_pairs))
+        return [
+            found.get(pair.metadata["statistic_id"], (0.0, 0.0, None))
+            if pair.last_stat_start is not None
+            else (0.0, 0.0, None)
+            for pair in pairs
+        ]
+
+    async def _async_add_statistics(self, pairs: list[_StatisticPair]) -> None:
+        """Add pairs of statistics (consumption/return, cost/compensation).
 
         Rows at or before the statistics they resume from are skipped; the rest
         replace what's there, so data the utility corrects or prices later is
         picked up.
         """
-        statistic_id = metadata["statistic_id"]
-        opposite_statistic_id = opposite_metadata["statistic_id"]
-        total = 0.0
-        opposite_total = 0.0
-        last_stats_time: float | None = None
-        if rows and last_stat_start is not None:
-            start = min(rows[0][0], dt_util.utc_from_timestamp(last_stat_start))
-            _LOGGER.debug("Getting statistics at: %s", start)
-            # In the common case there should be a previous statistic at start time
-            # so we only need to fetch one statistic. If there isn't any, fetch all.
-            stats = await get_instance(self.hass).async_add_executor_job(
-                self._get_statistics, start, {statistic_id, opposite_statistic_id}
-            )
-            if stats.get(statistic_id):
-
-                def _safe_get_sum(records: list[Any]) -> float:
-                    if records and "sum" in records[0]:
-                        return float(records[0]["sum"])
-                    return 0.0
-
-                total = _safe_get_sum(stats[statistic_id])
-                opposite_total = _safe_get_sum(stats.get(opposite_statistic_id, []))
-                last_stats_time = stats[statistic_id][0]["start"]
-
-        statistics = []
-        opposite_statistics = []
-        for start, state, opposite_state in rows:
-            if last_stats_time is not None and start.timestamp() <= last_stats_time:
-                continue
-            total += state
-            opposite_total += opposite_state
-            statistics.append(StatisticData(start=start, state=state, sum=total))
-            opposite_statistics.append(
-                StatisticData(start=start, state=opposite_state, sum=opposite_total)
-            )
-
-        _LOGGER.debug("Adding %s statistics for %s", len(statistics), statistic_id)
-        async_add_external_statistics(self.hass, metadata, statistics)
-        _LOGGER.debug(
-            "Adding %s statistics for %s",
-            len(opposite_statistics),
-            opposite_statistic_id,
+        if not pairs:
+            return
+        baselines = await get_instance(self.hass).async_add_executor_job(
+            self._get_baselines, pairs
         )
-        async_add_external_statistics(self.hass, opposite_metadata, opposite_statistics)
+        for pair, (total, opposite_total, last_stats_time) in zip(
+            pairs, baselines, strict=True
+        ):
+            statistics = []
+            opposite_statistics = []
+            for start, state, opposite_state in pair.rows:
+                if last_stats_time is not None and start.timestamp() <= last_stats_time:
+                    continue
+                total += state
+                opposite_total += opposite_state
+                statistics.append(StatisticData(start=start, state=state, sum=total))
+                opposite_statistics.append(
+                    StatisticData(start=start, state=opposite_state, sum=opposite_total)
+                )
+            if not statistics:
+                continue
+            for metadata, data in (
+                (pair.metadata, statistics),
+                (pair.opposite_metadata, opposite_statistics),
+            ):
+                _LOGGER.debug(
+                    "Adding %s statistics for %s", len(data), metadata["statistic_id"]
+                )
+                async_add_external_statistics(self.hass, metadata, data)
 
     async def _async_maybe_migrate_statistics(
         self,
